@@ -11,7 +11,9 @@ typedef struct {
     int fluDuration; // Number of weeks during flu season
 } ILIinput;
 
-void free_ili_input(ILIinput* data_p);
 int read_ili_csv(const char* fname, ILIinput* data_p);
+void free_ili_input(ILIinput* data_p);
+
+int read_csv_double_vector(const char* fname, double* *vec_p, int* vsize_p);
 
 #endif

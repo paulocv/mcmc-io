@@ -41,6 +41,21 @@ typedef struct ILIinputAux{
 } ILIinputAux;
 
 
+typedef struct ColumnInputAux{
+    // Data
+    int *size_p;  // Pointer to the size of the data.
+    double* *vec_p;  // Pointer to the data vector.
+
+    // Aux variables
+    size_t capacity;  // Assured number of allocated positions in the vector.
+    size_t curr_row;  // Row index (1-based) currently being read.
+    size_t curr_col;  // Column index (1-based) currently being read.
+    
+    int err_status;   // Error code for inner parsing errors (i.e., during callback)
+    char* err_field;  // Stores the value of the faulty field.
+} ColumnInputAux;
+
+
 #define PARSE_EINVALID 4  // Update this number when new error codes are included.
 static char *parse_errors[] = 
     /* 0 */{"success",
@@ -49,7 +64,6 @@ static char *parse_errors[] =
     /* 3 */ "line has too many fields",
     /* 4 */ "previous line has not enough fields",
     /*...*/ "invalid status code"};
-
 
 char* cb_err_str(int err_status){
     if (err_status >= PARSE_EINVALID || err_status < 0){
@@ -60,6 +74,25 @@ char* cb_err_str(int err_status){
     }
 }
 
+#define PARSE_EINVALID_DOUBLE 4  // Update this number when new error codes are included.
+static char *parse_errors_double[] = 
+    /* 0 */{"success",
+    /* 1 */ "could not convert string to double",
+    /* 2 */ "value is out of range for double",
+    /* 3 */ "line has too many fields",
+    /* 4 */ "previous line has not enough fields",
+    /*...*/ "invalid status code"};
+
+char* cb_err_str_double(int err_status){
+    if (err_status >= PARSE_EINVALID_DOUBLE || err_status < 0){
+        return parse_errors_double[PARSE_EINVALID_DOUBLE];
+    }
+    else{
+        return parse_errors_double[err_status];
+    }
+}
+
+// --------------
 
 int alloc_ili_input(ILIinput* data_p, size_t reserve_size){
     data_p->year =   (int*) malloc(reserve_size * sizeof(int));
@@ -115,8 +148,10 @@ static int is_term(unsigned char c) {
 int parse_int_error_check(const char* str, int *err_p, size_t len){
     /*
     Parses a string into an integer with multiple error checks:
+    - Invalid characters (number of parsed characters different then expected)
+        error code = 1
     - Overflow 
-    - Invalid characters (even if they come after valid ones)
+        error code = 2
     */
 
     char *cursor;
@@ -144,14 +179,37 @@ int parse_int_error_check(const char* str, int *err_p, size_t len){
 
 
 double parse_double_error_check(const char* str, int *err_p, size_t len){
-    // Pass
-    // TODO
+    /* 
+    Parses a string into a double with multiple error checks:
+    - Invalid characters (number of parsed characters different then expected)
+        error code = 1
+    - Overflow (number too large or to small for double type)
+        error code = 2
+    */
+    char *cursor;
+    double out;
+
+    // Parsing command
+    out = strtod(str, &cursor);
+
+    // Error checking
+    if ((cursor - str) != len){  // Number of parsed character was not the expected
+        *err_p = 1; 
+        return 0.0;
+    }
+
+    if (errno == ERANGE){  // Parsed number is out of range for double
+        *err_p = 2;
+        return 0.0;
+    }
+
+    return out;
 }
 
 
 
 // ------------------------------------------------------------------------------------------------
-// PARSING CALLBACK FUNCTIONS
+// PARSING CALLBACK FUNCTIONS – ILI INPUT
 // ------------------------------------------------------------------------------------------------
 
 /* 
@@ -233,6 +291,77 @@ void cb2 (int c, void *aux_vp) {
 
 
 // ------------------------------------------------------------------------------------------------
+// PARSING CALLBACK FUNCTIONS – CONTACTS INPUT
+// ------------------------------------------------------------------------------------------------
+
+void contacts_cb1(void *s_v, size_t len, void *aux_vp){
+
+    // Convert void pointers to meaningful types
+    char* s = (char*) s_v;
+    ColumnInputAux* aux_p = (ColumnInputAux*) aux_vp;
+    double* *vec_p = aux_p->vec_p;
+    int size = *(aux_p->size_p);
+
+    if (aux_p->curr_row == 1) return;  // Ignore first row of the file
+    if (aux_p->err_status) return;  // Do not parse if an error occurred before
+
+    switch (aux_p->curr_col){
+    case 0:
+    case 1:
+        // DO NOTHING. These columns are ignored.
+        // OBS: case 0 should not be reached, columns are 1-based.
+        break;
+
+    case 2:
+        (*vec_p)[size] = parse_double_error_check(s, &aux_p->err_status, len);
+        break;
+    
+    default:
+        // aux_p->err_status = 3;  // line has too many fields (this check is not performed)
+        break;
+    }
+
+    // If there was an error, registers the field for later reporting.
+    if (aux_p->err_status){
+        aux_p->err_field = (char*) malloc(len + 1 * sizeof(char));
+        strcpy(aux_p->err_field, s);
+        return;  // Prevents curr_col from being updated.
+    }
+    
+    aux_p->curr_col++;
+
+}
+
+void contacts_cb2(int c, void *aux_vp){
+    // Convert void pointers to meaningful types
+    ColumnInputAux* aux_p = (ColumnInputAux*) aux_vp;
+    double* *vec_p = aux_p->vec_p;
+    int *size_p = aux_p->size_p;
+
+    if (aux_p->err_status) return;  // Do not operate if there was a parsing error.
+
+    // Check for the number of fields
+    if (aux_p->curr_col - 1 < 2 && aux_p->curr_row > 1){  // -1 as it was previously incremented
+        aux_p->err_status = 4;  // previous line has not enough fields
+        aux_p->err_field = (char*) malloc(2 * sizeof(char));
+        strcpy(aux_p->err_field, "");
+    }
+
+    // Update cursors
+    aux_p->curr_col = 1;
+    if (aux_p->curr_row++ == 1) return;  // Update current row AND ignore if it's the first one.
+
+    (*size_p)++;  // If line was valid, increments the size of data containers.
+
+    // Dynamical vector reallocation (doubles capacity if needed).
+    if (*size_p >= aux_p->capacity){
+        aux_p->capacity *= 2;
+        *vec_p = (double*) realloc(*vec_p, aux_p->capacity * sizeof(double));
+    }
+}
+
+
+// ------------------------------------------------------------------------------------------------
 // HIGH-LEVEL INTERFACE FUNCTIONS
 // ------------------------------------------------------------------------------------------------
 
@@ -244,7 +373,7 @@ Assumes that the file has the following 4 columns:
 "index", "year","week","est_Inc"
 
 Where the first column ("index") is ignored. 
-The first row of the file is assumed as index and is also ignored.
+The first row of the file is assumed as header and is also ignored.
 
 
 @param fname  Path for the csv file. Must be a null-terminated string.
@@ -261,7 +390,7 @@ int read_ili_csv(const char* fname, ILIinput* data_p){
     char buf[FILE_BUF_SIZE];
     size_t bytes_read;
     unsigned char options = 0;
-    const size_t reserve_size = 53;  // Could be a parameter, but no optionals in C.
+    const size_t reserve_size = 53;  // Initial size of the ILI vectors.
     ILIinputAux aux = {};
 
     // Initialization
@@ -275,11 +404,13 @@ int read_ili_csv(const char* fname, ILIinput* data_p){
     aux.err_field = NULL;
 
     // Initial allocation of the struct pointers
-    alloc_ili_input(data_p, reserve_size);
+    if (alloc_ili_input(data_p, reserve_size)){
+        return EXIT_FAILURE;
+    };
 
     // Initialiation of the parser
     if (csv_init(&parser, options) != 0) {
-        fprintf(stderr, "Failed to initialize csv parser\n");
+        fprintf(stderr, "Failed to initialize csv parser @ read_ili_csv.\n");
         return EXIT_FAILURE;
     }
 
@@ -334,6 +465,113 @@ int read_ili_csv(const char* fname, ILIinput* data_p){
 
     fclose(fp);
     csv_fini(&parser, cb1, cb2, &aux);  // Closes the csv parser.
+    csv_free(&parser);  // Frees the csv parser.
+
+    return EXIT_SUCCESS;
+}
+
+
+/* 
+Reads a csv file with double data (one ignored index column and one data column).
+
+The first column ("index") is ignored. 
+The first row of the file is assumed as header and is also ignored.
+
+
+@param fname  Path for the csv file. Must be a null-terminated string.
+@param vec_p   Pointer to a vector of doubles, where data will be stored. Does not need
+     to be preallocated.
+@param vsize_p   Pointer to the size of the vector. Does not need to be preset.
+
+@return An integer error code.
+*/
+int read_csv_double_vector(const char* fname, double* *vec_p, int* vsize_p){
+
+    // Declarations
+    // ------------
+    FILE *fp;
+    struct csv_parser parser;
+    char buf[FILE_BUF_SIZE];
+    size_t bytes_read;
+    unsigned char options = 0;
+    const size_t reserve_size = 25;  // Initial size of the ILI vectors.
+    ColumnInputAux aux;
+
+    // Initializations
+    // ---------------
+
+    // Initialiation of the parser
+    if (csv_init(&parser, options) != 0) {
+        fprintf(stderr, "Failed to initialize csv parser @ read_csv_double_vector.\n");
+        return EXIT_FAILURE;
+    }
+
+    // Set option to append null string terminator to each field
+    options += CSV_APPEND_NULL;  
+    csv_set_opts(&parser, options); 
+
+    // Initialization of the auxiliary parser structure.
+    aux.vec_p = vec_p;
+    aux.size_p = vsize_p;
+    aux.capacity = reserve_size;
+    aux.curr_row = aux.curr_col = 1;
+    aux.err_status = 0;
+    aux.err_field = NULL;
+
+
+    // First allocation of the data vector
+    *vec_p = (double*) malloc(reserve_size * sizeof(double));
+    if (! *vec_p){
+        fprintf(stderr, "Failed to allocate double vector @ read_csv_double_vector.\n");
+        return EXIT_FAILURE;
+    }
+
+    *vsize_p = 0;
+
+
+    // Execution
+    // ---------
+    
+    // --- File opening
+    fp = fopen(fname, "rb");
+    if (!fp) {
+        fprintf(stderr, "Failed to open %s: \"%s\"\n", fname, strerror(errno));
+        return(EXIT_FAILURE);
+    }
+
+    // --- Main loop for reading and parsing the file
+    while ((bytes_read=fread(buf, 1, FILE_BUF_SIZE, fp)) > 0) {
+        if (csv_parse(&parser, buf, bytes_read, contacts_cb1, contacts_cb2, &aux) != bytes_read) {
+            fprintf(stderr, "Error while parsing file: \"%s\"\n", csv_strerror(csv_error(&parser)));
+            break;
+        }
+
+        // Handle inner parsing error
+        if (aux.err_status){
+            fprintf(stderr, "Error parsing field (\"%s\") at line %lu: %s\n",
+                aux.err_field, aux.curr_row, cb_err_str_double(aux.err_status));
+            free(aux.err_field);
+            break;
+        }
+    }
+
+    // Shrink to fit the actual vector size
+    if (aux.capacity > *vsize_p)
+        *vec_p = (double*) realloc(*vec_p, *vsize_p * sizeof(double));
+
+    if (ferror(fp) || aux.err_status || parser.status) {
+        fprintf(stderr, "Error while reading file \"%s\"\n", fname);
+        fclose(fp);
+        csv_free(&parser);  // Frees the csv parser.
+        return(EXIT_FAILURE);
+    }
+
+    // Final operations
+    // ----------------
+
+    fclose(fp);
+
+    csv_fini(&parser, contacts_cb1, contacts_cb2, &aux);  // Closes the csv parser.
     csv_free(&parser);  // Frees the csv parser.
 
     return EXIT_SUCCESS;
